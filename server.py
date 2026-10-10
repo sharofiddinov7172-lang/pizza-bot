@@ -14,6 +14,7 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
 # SOZLAMALAR (SIZNING MA'LUMOTLARINGIZ)
 # ==========================================
 BOT_TOKEN = "8882834267:AAEDMNbJMryHKxGqlnB9DRpfEq5TFvCayyA"
+ADMIN_ID = 8126690617
 PORT = int(os.environ.get("PORT", 80))
 
 # WebApp havolasi (Render serveri avtomatik o'zining RENDER_EXTERNAL_URL manzilini beradi)
