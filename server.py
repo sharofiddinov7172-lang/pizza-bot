@@ -5,6 +5,8 @@ import subprocess
 import re
 import atexit
 import time
+import sqlite3
+import json
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import telebot
@@ -73,6 +75,38 @@ PRODUCTS = [
     }
 ]
 
+# ==========================================
+# MA'LUMOTLAR BAZASI (SQLite)
+# ==========================================
+DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "orders.db")
+
+def init_db():
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER,
+                customer_name TEXT,
+                phone TEXT,
+                items TEXT,
+                total_sum REAL,
+                location TEXT,
+                lat REAL,
+                lon REAL,
+                payment_type TEXT,
+                status TEXT DEFAULT 'kutilmoqda',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Baza yaratishda xatolik: {e}")
+
+init_db()
+
 # ----------------- FLASK YO'NALISHLARI -----------------
 
 @app.route('/')
@@ -87,16 +121,71 @@ def serve_static(path):
 def get_products():
     return jsonify(PRODUCTS)
 
+@app.route('/api/orders', methods=['GET'])
+def get_orders():
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, telegram_id, customer_name, phone, items, total_sum, location, payment_type, status, created_at FROM orders ORDER BY id DESC LIMIT 50")
+        rows = cursor.fetchall()
+        conn.close()
+        orders = []
+        for r in rows:
+            orders.append({
+                "id": r[0],
+                "telegramId": r[1],
+                "customerName": r[2],
+                "phone": r[3],
+                "items": json.loads(r[4]) if r[4] else [],
+                "totalSum": r[5],
+                "location": r[6],
+                "paymentType": r[7],
+                "status": r[8],
+                "createdAt": r[9]
+            })
+        return jsonify(orders)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/api/orders', methods=['POST'])
 def create_order():
     data = request.json or {}
     telegram_id = data.get('telegramId')
+    customer_name = data.get('name', 'Mijoz')
+    phone = data.get('phone', "Kiritilmagan")
     items = data.get('items', [])
     total_sum = data.get('totalSum', 0)
+    location = data.get('location', "Ko'rsatilmagan")
+    coords = data.get('coords') or {}
+    payment_type = data.get('paymentType', 'Naqd')
 
-    # 1. Adminga xabar matnini tayyorlash
-    admin_msg = "🛒 <b>YANGI BUYURTMA QABUL QILINDI!</b>\n\n"
-    admin_msg += f"👤 <b>Mijoz ID:</b> <code>{telegram_id}</code>\n"
+    lat = coords.get('lat') if isinstance(coords, dict) else None
+    lon = coords.get('lon') if isinstance(coords, dict) else None
+
+    # 1. Bazaga saqlash
+    order_id = None
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO orders (telegram_id, customer_name, phone, items, total_sum, location, lat, lon, payment_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (telegram_id, customer_name, phone, json.dumps(items, ensure_ascii=False), total_sum, location, lat, lon, payment_type))
+        order_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Bazaga yozishda xatolik: {e}")
+
+    # 2. Adminga xabar matnini tayyorlash
+    order_num = f"#{order_id}" if order_id else ""
+    payment_icon = "💵" if payment_type == "Naqd" else "💳"
+    
+    admin_msg = f"🛒 <b>YANGI BUYURTMA {order_num}!</b>\n\n"
+    admin_msg += f"👤 <b>Mijoz:</b> {customer_name} (ID: <code>{telegram_id}</code>)\n"
+    admin_msg += f"📞 <b>Telefon:</b> {phone}\n"
+    admin_msg += f"📍 <b>Manzil:</b> {location}\n"
+    admin_msg += f"💳 <b>To'lov turi:</b> {payment_icon} <b>{payment_type}</b>\n"
     admin_msg += f"⏰ <b>Vaqti:</b> Hozir\n\n"
     admin_msg += "📦 <b>Buyurtma tarkibi:</b>\n"
     
@@ -105,25 +194,33 @@ def create_order():
 
     admin_msg += f"\n💰 <b>JAMI TO'LOV:</b> <u>{total_sum:,} so'm</u>"
 
-    # Adminga yuborish
+    # Adminga xabar va lokatsiyani yuborish
     try:
         bot.send_message(ADMIN_ID, admin_msg)
+        # Agar GPS koordinatalari mavjud bo'lsa, xaritadagi pinni ham yuboramiz
+        if lat and lon:
+            try:
+                bot.send_location(ADMIN_ID, latitude=lat, longitude=lon)
+            except Exception as loc_e:
+                print(f"Lokatsiya pinini yuborishda xatolik: {loc_e}")
     except Exception as e:
         print(f"Adminga xabar yuborishda xatolik: {e}")
 
     # Mijozga tasdiq xabarini yuborish
     try:
         if telegram_id:
-            bot.send_message(
-                telegram_id,
-                f"✅ <b>Buyurtmangiz muvaffaqiyatli qabul qilindi!</b>\n\n"
-                f"💰 Umumiy summa: <b>{total_sum:,} so'm</b>\n"
-                f"🛵 Kuryerimiz 30 daqiqa ichida yetkazib beradi."
+            client_msg = (
+                f"✅ <b>Buyurtmangiz muvaffaqiyatli qabul qilindi! 🍕</b>\n\n"
+                f"📍 <b>Yetkazish manzili:</b> {location}\n"
+                f"💳 <b>To'lov turi:</b> {payment_icon} {payment_type}\n"
+                f"💰 <b>Jami summa:</b> {total_sum:,} so'm\n\n"
+                f"🛵 Kuryerimiz tez orada siz bilan bog'lanadi!"
             )
+            bot.send_message(telegram_id, client_msg)
     except Exception as e:
         print(f"Mijozga xabar yuborishda xatolik: {e}")
 
-    return jsonify({"status": "success", "message": "Buyurtma qabul qilindi"})
+    return jsonify({"status": "success", "orderId": order_id, "message": "Buyurtma qabul qilindi"})
 
 
 # ----------------- TELEGRAM BOT BUYRUQLARI -----------------
